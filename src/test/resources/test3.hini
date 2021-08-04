@@ -1,0 +1,7 @@
+export mainTree
+[final mainModule]
+final id = 1
+#[core: allow]
+[:core]
+id = ::mainModule.id
+name = (id=::core.id) test

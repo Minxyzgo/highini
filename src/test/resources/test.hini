@@ -1,0 +1,33 @@
+[test: main ]
+only = 0
+list: [1, 2, 3]
+map: {test1: 15, test2: 16}
+test = true
+[test: module extends main]
+only = 1
+test: true
+# main.list: [2,3]
+[module2]
+only = 2
+main.map[test3] = 17
+main.map[test4] = 18
+
+# 某些情况下，单一tree文件中可能只允许一个携带此tag的section出现
+# 而显示指定它又过于麻烦。
+# 因此使用这种语法可以很方便地应用该单一tag section，并对此进行特殊操作。
+# 也就是说，不可以自行指定section名，而用tag名来代替。
+[:module3]
+# final.不可以再次被继承。
+[final module4 extends module2]
+#2
+only = ::module.only
+#2
+# 省略key。等同于only = ::module2.only
+#only = ::module2
+#等同于 test = ::main.map(test)
+#test = ::main.map
+#语法糖加大阅读难度。且没有较为合适的实现。故暂不考虑
+ste = ::main.map[test2]
+ste2 = ::self.ste
+# 由于ini 不支持 "" ，容易混淆。所以使用::来引用。
+trigger = if(::self.ste == ::main.map[test2])
