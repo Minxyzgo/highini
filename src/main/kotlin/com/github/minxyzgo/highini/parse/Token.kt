@@ -3,6 +3,7 @@ package com.github.minxyzgo.highini.parse
 object Token {
     val allSection = Regex("""^\[.*]""")
     val map = Regex("""^\{.*}""")
+    val stringTemplate = Regex("""\$\{.*}""")
     val section = Regex("""(?<=\[)[\d\w]+(?=])""")
 //    val key = Regex("""\w*(?=:)""")
 //    val value = Regex("""(?<=:)\w*""")

@@ -1,0 +1,9 @@
+export mainTree
+[:core]
+id: 5
+#true
+autoTrigger: if true
+#true
+trigger: if core.id > 4 and core.autoTrigger
+#true
+trigger2: if (45<4&&core.trigger)||5>4

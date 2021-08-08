@@ -5,12 +5,13 @@ import com.github.minxyzgo.highini.exception.ParseException.Companion.setStackTr
 import com.github.minxyzgo.highini.func.*
 import com.github.minxyzgo.highini.type.*
 import com.github.minxyzgo.highini.util.*
+import jdk.nashorn.internal.runtime.regexp.joni.*
 import java.io.*
-import java.lang.IllegalStateException
 import java.lang.reflect.*
 import java.util.*
 
-open class Parser {
+
+open class Parser(val accessible: Boolean = false) {
     val classParsers = mutableMapOf<Class<*>, (value: String) -> Any>()
     val tags = mutableListOf<ConfigTag>()
     val includes = mutableListOf<ConfigTree>()
@@ -99,6 +100,8 @@ open class Parser {
 
     open fun endParse() {
         println("end parse")
+        if(includes.hasTheSameName() || configTreeList.hasTheSameName())
+            throw ParseException("There cannot be trees with the same name in the external library.")
         cacheSection.forEach { (_, v) ->
             println("parse cache 1")
             val k = v.extendsSection
@@ -136,32 +139,7 @@ open class Parser {
 
         cacheSection.forEach { (_, v) ->
             println("parse cache 2")
-            var superSection = v.section.extendsSection!!.apply { println("base: $name") }
-            val cache = mutableListOf<ConfigSection>()
-            while(superSection.extendsSection != null && !superSection.isExtended) {
-                if(superSection in cache) {
-                    superSection.setStackTrace()
-                    throw ParseException("Cyclic inheritance.")
-                }
-                superSection = superSection.extendsSection!!.apply { println("name: $name") }
-                cache.add(superSection)
-                println("while")
-            }
-            v.section.setStackTrace()
-            if(superSection.isFinal) throw ParseException("Cannot extends a final section.")
-
-            fun ConfigSection.forEachChildren(): Unit = this.children.forEach loop@{ child: ConfigSection ->
-                if(child.isExtended) return
-                println("for each child : ${child.name}")
-                this.mutableMap.forEach { (key, value) ->
-                    if(child[key] != null && value.isFinal) throw ParseException("Cannot override a final value.")
-                    if(child[key] == null) child[key] = value
-                }
-                child.isExtended = true
-                if(child.children.isNotEmpty()) child.forEachChildren()
-            }
-
-            superSection.forEachChildren()
+            v.section.extends()
         }
 
         val necessaryTags = tags.filter { it.isNecessary }.map { it.name }.toMutableSet()
@@ -191,7 +169,7 @@ open class Parser {
         tree.setStackTrace(index)
         val tag_ = message.split(":", limit = 2)
         var tag: ConfigTag? = null
-        val baseName: String
+        var baseName: String? = null
         var isFinal = false
         var name: String? = null
         var extendsSection: String? = null
@@ -219,8 +197,8 @@ open class Parser {
         if(tag_.size > 1) {
             val tagStr = tag_[0].trim()
             println("tagStr: $tagStr")
-
-            name = parseExtends(parseFinal(tagStr))
+            parseFinal(tagStr)
+            name = parseExtends(tag_[1].trim())
 
             if(tagStr.isBlank()) {
                 name = parseExtends(tag_[1].trim())
@@ -235,14 +213,13 @@ open class Parser {
                 }
             }
             if(tag == null) throw UnresolvedReferenceException("Unknown tag.")
-            baseName = tag_[1].trim()
         } else {
             baseName = message
         }
 
 
 
-        name = name ?: parseExtends(parseFinal(baseName))
+        name = name ?: parseExtends(parseFinal(baseName!!))
         if(extendsSection == name) throw ParseException("Can't make section extends itself.")
         Keyword.values().forEach {
             if(name.contains(it.codeName()))
@@ -250,7 +227,7 @@ open class Parser {
         }
 
         if(tree[name] != null) throw ParseException("The tree cannot have a section with the same name.")
-
+        println("name : $name")
         val section = ConfigSection(
             name,
             sectionString,
@@ -286,7 +263,7 @@ open class Parser {
 
         section.tag?.run {
             reader?.let {
-                it(section, value.name, value.stringValue)
+                it(section, value.name, value.stringValue, value.line)
             }?.let { v ->
                 value.value = v
                 return@parseValue
@@ -297,7 +274,7 @@ open class Parser {
             val fieldMap = it.allFieldMap()
             val field = fieldMap[value.name]
             if(field != null) {
-                val v = internalParse(field.type, section.parent!!, value.name, value.stringValue, value.line)
+                val v = internalParse(field.type, section.parent!!, value.stringValue, value.line)
                 if(v != null) {
                     value.value = v
                 } else {
@@ -320,24 +297,34 @@ open class Parser {
                 value.stringValue,
                 value.line
             )
-        } else if(value.stringValue.contains("::")) {
-            value.value = parseStringReference(
+        } else if(value.stringValue.startsWith("::")) {
+            value.value = parseReferenceValue(
                 section.parent!!,
                 value.stringValue,
                 value.line
             )
+        } else if(value.stringValue.startsWith("if")) {
+            value.value = parseBoolean(
+                value.stringValue,
+                section.parent!!,
+                value.line
+            )
+        } else if(value.stringValue.contains(Token.stringTemplate)) {
+            value.value = parseStringTemplate(section.parent!!, value.stringValue, value.line)
         }
     }
 
     @Suppress("UNCHECKED_CAST")
     protected fun <T> parseList(tree: ConfigTree, value: String, line: Int): List<T> {
         tree.setStackTrace(line)
+        println("value : $value")
         if (value.startsWith("[")) {
             if (!value.endsWith("]")) throw SyntaxException("Missing ] after list.")
             val message = value.removePrefix("[").removeSuffix("]").split(",")
+            println("msg $message")
             return message.map {
                 it.trim().run {
-                    (parseStringReference(tree, value, line) ?: it) as T
+                    (parseReferenceValue(tree, this, line) ?: it) as T
                 }
             }
         } else {
@@ -356,8 +343,8 @@ open class Parser {
                 if(split.size < 2) throw SyntaxException("Missing : in the map.")
                 val k = split[0].trim()
                 val v = split[1].trim()
-                val tryParseKey = parseStringReference(tree, k, line)
-                val tryParseValue = parseStringReference(tree, v, line)
+                val tryParseKey = parseReferenceValue(tree, k, line)
+                val tryParseValue = parseReferenceValue(tree, v, line)
                 ((tryParseKey ?: k) as K) to ((tryParseValue ?: v) as V)
             }
         } else {
@@ -369,20 +356,21 @@ open class Parser {
     protected open fun internalParse(
         type: Class<*>,
         tree: ConfigTree,
-        key: String,
         value: String,
         line: Int
     ): Any? {
-        return when(type) {
+        return parseReferenceValue(tree, value, line) ?: when(type) {
             List::class.java -> parseList<String>(tree, value, line)
             Array::class.java -> parseList<String>(tree, value, line).toTypedArray()
             Map::class.java -> parseMap<String, String>(tree, value, line)
+            Boolp::class.java -> parseBoolean(value, tree, line)
+            String::class.java -> parseStringTemplate(
+                tree, value, line
+            )
             else -> null
-        } ?:
-        parseStringReference(tree, value, line) ?: when (type) {
+        } ?: when (type) {
             Int::class.java -> value.toInt()
             Long::class.java -> value.toLong()
-            String::class.java -> value
             Char::class.java -> {
                 if (value.length > 1)
                     throw IllegalStateException("$value is not a char.")
@@ -405,101 +393,100 @@ open class Parser {
         }
     }
 
-
-    protected fun parseStringReference(
+    protected fun parseStringTemplate(
         tree: ConfigTree,
         value: String,
-        line: Int
-    ): Any? {
-        if(value.contains("::")) {
-            //var list: List<TemporaryReference>? = null
-            var str: String? = null
-            parseReferenceValue(
+        line: Int,
+        defaultSection: ConfigSection? = null
+    ): String {
+        var result = value
+        for(input in Token.stringTemplate.findAll(value)) {
+            val v = input.value
+            val str = parseGetReference(
+                v
+                    .removePrefix("\${")
+                    .removeSuffix("}"),
                 tree,
-                value,
-                line
-            ) { s, _ ->
-               // list = l
-                str = s
-            }
-
-//            if(list!!.size > 1) {
-//                return str!!
-//            } else {
-//                return list!!.first().value!!
-//            }
-            return str!!
-        } else {
-            return null
+                line,
+                defaultSection
+            ).value!!().toString()
+            result = result.replace(v, str)
         }
+        return result
     }
 
     protected fun parseReferenceValue(
         tree: ConfigTree,
         stringValue: String,
-        line: Int,
-        action: (String, List<TemporaryReference>) -> Unit
-    ) {
-
-        val iterable = stringValue.iterator()
-        val list = mutableListOf<TemporaryReference>()
-        var parseString = stringValue
-        var lastValue = ""
-        var inRef = false
-
-        while(iterable.hasNext()) {
-            when(val last = iterable.nextChar()) {
-                ':' -> {
-                    val next = iterable.nextChar()
-                    if(next == ':') {
-                        inRef = true
-                        lastValue += "::"
-                    } else if(inRef) {
-                        lastValue += ':'
-                    }
-                }
-
-                in 'A'..'Z', in '0'..'9', in 'a'..'z', '.', '[', ']' -> {
-                    if(inRef) lastValue += last
-                }
-
-                else -> {
-                    if(inRef) {
-                        if(lastValue.isBlank()) continue
-                        val reference = parseGetReference(
-                            lastValue.removePrefix("::").trimEnd(),
-                            tree,
-                            line
-                        )
-
-                        parseString = parseString.replace(lastValue.trimEnd(), reference.value.toString())
-                        list.add(reference)
-                        lastValue = ""
-                        inRef = false
-                    }
-                }
-
-
-            }
-        }
-        println("lastValue: $lastValue")
-        if(lastValue.isNotBlank() && inRef) {
-            val reference = parseGetReference(
-                lastValue.removePrefix("::"),
-                tree,
-                line
-            )
-            list.add(reference)
-            parseString = parseString.replace(lastValue, reference.value.toString())
-        }
-
-        action(parseString, list.toList())
+        line: Int
+    ): Any? {
+        return if(stringValue.startsWith("::"))
+            parseGetReference(stringValue.removePrefix(("::")), tree, line).value!!()
+        else
+            null
+//
+//        val iterable = stringValue.iterator()
+//        val list = mutableListOf<TemporaryReference>()
+//        var parseString = stringValue
+//        var lastValue = ""
+//        var inRef = false
+//        println("stringValue $stringValue")
+//        while(iterable.hasNext()) {
+//            when(val last = iterable.nextChar()) {
+//                ':' -> {
+//                    val next = iterable.nextChar()
+//                    if(next == ':') {
+//                        inRef = true
+//                        lastValue += "::"
+//                    } else if(inRef) {
+//                        lastValue += ':'
+//                    }
+//                }
+//
+//                in 'A'..'Z', in '0'..'9', in 'a'..'z', '.', '[', ']' -> {
+//                    if(inRef) lastValue += last
+//                }
+//
+//                else -> {
+//                    if(inRef) {
+//                        if(lastValue.isBlank()) continue
+//                        val reference = parseGetReference(
+//                            lastValue.removePrefix("::").trimEnd(),
+//                            tree,
+//                            line
+//                        )
+//
+//                        parseString = parseString.replace(lastValue.trimEnd(), reference.value!!().toString())
+//                        list.add(reference)
+//                        lastValue = ""
+//                        inRef = false
+//                    }
+//                }
+//
+//
+//            }
+//        }
+//        println("lastValue: $lastValue")
+//        if(lastValue.isNotBlank() && inRef) {
+//            val reference = parseGetReference(
+//                lastValue.removePrefix("::"),
+//                tree,
+//                line
+//            )
+//            list.add(reference)
+//            parseString = parseString.replace(lastValue, reference.value!!().toString())
+//        }
+//
+//        action(parseString, list.toList())
     }
+
+
 
     protected open fun parseGetReference(
         key: String,
         configTree: ConfigTree,
-        line: Int
+        line: Int,
+        defaultSection: ConfigSection? = null
     ): TemporaryReference {
         configTree.setStackTrace(line)
         val temporaryReference = TemporaryReference()
@@ -507,58 +494,85 @@ open class Parser {
         val reference = key.split(".").iterator()
         var section: ConfigSection? = null
         val first = reference.next()
-        for(tree in configTreeList) {
-            if(tree[first] != null) {
-                section = tree[first]
-                break
+        if(defaultSection == null || first != defaultSection.name) {
+            for (tree in configTreeList) {
+                if (tree[first] != null) {
+                    section = tree[first]
+                    break
+                }
             }
-        }
 
-        if(section == null) {
-            val _tree = includes.firstOrNull { it.name == first }
-            section = _tree?.get(reference.next())
-        }
+            if (section == null) {
+                val _tree = includes.firstOrNull { it.name == first }
+                section = _tree?.get(reference.next())
+            }
 
-        if(section == null) throw UnresolvedReferenceException("Unknown section ${first}.")
+            if (section == null) throw UnresolvedReferenceException("Unknown section ${first}.")
+        } else {
+            section = defaultSection
+        }
         if(!reference.hasNext()) return TemporaryReference({ section }, parentSection = section)
         var lastValue: Any? = null
         var isFirst = true
+        println("continue")
+        defaultSection?.mutableMap?.values?.forEach {
+            println("get key ${it.name} value ${it.value}")
+        }
         while(reference.hasNext()) {
             val baseKey = reference.next()
             fun isLast() = !reference.hasNext()
+            fun parseConfigValueRef(it: ConfigValue, keyStr: String) {
+                val v = if(it.stringValue.contains(Token.stringTemplate)) {
+                    defaultSection?.let { se ->
+                        parseStringTemplate(
+                            (lastValue as ConfigSection).parent!!,
+                            se.stringValue,
+                            se.line,
+                            defaultSection
+                        )
+                    } ?: it.value
+                } else if(it.value is Boolp && defaultSection != null) {
+                    parseBoolean(it.stringValue, (lastValue as ConfigSection).parent!!, it.line, defaultSection).get()
+                } else if(it.value is Prov<*>) {
+                    (it.value as Prov<*>).get()
+                } else {
+                    it.value
+                }
+                if(isLast()) {
+                    with(temporaryReference) {
+                        value = {
+                            v
+                        }
+                        this.index = keyStr
+                        parent = section
+                    }
+                } else {
+                    lastValue = v
+                }
+            }
             fun parseRef(keyStr: String) {
-                lastValue = if(isFirst) {
-                    (section[keyStr]?.value
+                if(isFirst) {
+                    (section[keyStr]
                         ?: throw UnresolvedReferenceException("Unknown keyValue $baseKey."))
                         .also {
-                            if(isLast()) {
-                                with(temporaryReference) {
-                                    value = { it }
-                                    this.index = keyStr
-                                    parent = section
-                                }
-                            }
+                            parseConfigValueRef(it, keyStr)
                         }
                     isFirst = false
                 }
                 else when(lastValue) {
                     is ConfigSection -> {
-                        (lastValue as ConfigSection)[keyStr].also {
-                            if(isLast()) {
-                                with(temporaryReference) {
-                                    value = { it }
-                                    this.index = keyStr
-                                    parent = lastValue as ConfigSection
-                                }
-                            }
+                        (lastValue as ConfigSection)[keyStr]!!.also {
+                            parseConfigValueRef(it, keyStr)
                         }
                     }
 
                     else -> {
-                        val fieldMap = lastValue!!::class.java.allFieldMap()
+                        val fieldMap = lastValue!!::class.java.apply{ println(this.name) }.allFieldMap()
+                        println("fieldMap $fieldMap")
                         (fieldMap.values.firstOrNull { it.name == keyStr }
                             ?: throw UnresolvedReferenceException("field: $keyStr is not defined."))
                             .also {
+                                if(accessible) it.isAccessible = true
                                 if(isLast()) temporaryReference.field = it
                             }
                             .get(lastValue)
@@ -568,6 +582,8 @@ open class Parser {
                                         parent = lastValue
                                         value = { it }
                                     }
+                                } else {
+                                    lastValue = it
                                 }
                             }
                     }
@@ -633,7 +649,7 @@ open class Parser {
 
         when {
             result.field != null -> {
-                val v = internalParse(result.field!!.type, tree, key, value, line)
+                val v = internalParse(result.field!!.type, tree, value, line)
                 result.field!!.set(result.parent!!, v)
             }
 
@@ -656,100 +672,217 @@ open class Parser {
     protected fun parseBoolean(
         value: String,
         tree: ConfigTree,
-        line: Int
+        line: Int,
+        defaultSection: ConfigSection? = null
     ): Boolp {
+        if(!value.startsWith("if")) throw SyntaxException("syntax error.")
+        val split = value.removePrefix("if").iterator()
         tree.setStackTrace(line)
 
-        val split = value
-            .replace("&&", " && ")
-            .replace("||", " || ")
-            .split(" ")
-            .filter { it.isNotBlank() }
-            .iterator()
-        var isAnd = false
-        var isNot = false
-        var isOr = false
-      //  var isFirst = true
-        var last: (() -> Any?)? = null
+        val list = mutableListOf<String>()
 
-        val list = mutableListOf<(Boolean) -> Boolean>()
+        val stack = Stack<String>()
+        val output = mutableListOf<Any>()
+        var last = ""
+        fun add() {
+            println("last $last")
+            if(last.isNotBlank()) {
+                list.add(last)
 
-        fun add(boolp: () -> Boolean) {
-            if(list.isEmpty()) {
-                list.add {  (if(isNot) !boolp.invoke() else boolp.invoke()) }
-            } else if(isAnd) {
-                list.add { bool ->
-                    bool && (if(isNot) !boolp.invoke() else boolp.invoke())
-                }
-                isAnd = false
-            } else if(isOr) {
-                list.add { bool ->
-                    bool ||  (if(isNot) !boolp.invoke() else boolp.invoke())
-                }
-                isOr = false
+                last = ""
             }
-            if(isNot) isNot = false
         }
-        /*
         while(split.hasNext()) {
-            val str = split.next()
-            when(str) {
-                "and", "&&" -> {
-                    if(last == null) throw SyntaxException("syntax error.")
-                    else if(isAnd || isOr) throw SyntaxException("syntax error.")
-                    else isAnd = true
-                }
+            when(val next = split.next()) {
+                ' ' -> add()
 
-                "or", "||" -> {
-                    if(last == null) throw SyntaxException("syntax error.")
-                    else if(isAnd || isOr) throw SyntaxException("syntax error.")
-                    else isOr = true
-                }
-
-                "not" -> {
-                    if(isNot) throw SyntaxException("syntax error.")
-                    else isNot = true
-                }
-
-                "in", "!in" -> {
+                '&' -> {
                     val _next = split.next()
-                    val v = last()
-                    if(!last.contains(Token.number) || !_next.contains(Token.numberRange))
-                        throw SyntaxException("syntax error.")
-                   add {
-                        val _next_range = _next.split("..")
-                        val first = _next_range[0].toInt()
-                        val second = _next_range[1].toInt()
-                        str.toInt() in first..second
+                    if(_next == '&') {
+                        add()
+                        list.add("and")
+                    } else {
+                        last += '&'
+                        last += _next
                     }
-                    last = ""
+                }
+
+                '|' -> {
+                    val _next = split.next()
+                    if(_next == '|') {
+                        add()
+                        list.add("or")
+                    } else {
+                        last += '|'
+                        last += _next
+                    }
+                }
+
+                '>' -> {
+                    add()
+                    val _next = split.next()
+                    if(_next == '=') {
+                        list.add(">=")
+                    } else {
+                        list.add(">")
+                        last += _next
+                    }
+                }
+
+                '<' -> {
+                    add()
+                    val _next = split.next()
+                    if(_next == '=') {
+                        list.add("<=")
+                    } else {
+                        list.add("<")
+                        last += _next
+                    }
+                }
+
+                '!' -> {
+                    add()
+                    val _next = split.next()
+                    if(_next == '=') {
+                        list.add("!=")
+                    } else {
+                        list.add("not")
+                        last += _next
+                    }
+                }
+
+                '=' -> {
+                    add()
+                    val _next = split.next()
+                    if(_next == '=') {
+                        list.add("==")
+                    } else {
+                        throw SyntaxException("syntax error.")
+                    }
+                }
+
+                '(' -> {
+                    add()
+                    list.add("(")
+                }
+
+                ')' -> {
+                    add()
+                    list.add(")")
                 }
 
                 else -> {
-                    if(last.isNotBlank())
-                       throw SyntaxException("syntax error.")
-                    if(str.contains(Regex("""true|false"""))) {
-                        val _isNot = isNot
-                        add { str.toBoolean()  }
-                    } else if(str.contains(".")) {
-                        val result = parseGetReference(
-                            str,
-                            tree,
-                            line
-                        )
+                    last += next
+                }
+            }
+        }
 
-                        when(result.value()) {
-                            is Number -> lastValue
+        if(last.isNotBlank()) {
+            add()
+        }
+
+        println("output $output")
+        println("list $list")
+
+        for(str in list) {
+            val op = Operation.values().firstOrNull { it.name == str || it.code == str }
+            when {
+                op != null -> {
+                    if (stack.isEmpty() || "(" == stack.peek() || op.priority > Operation.valueOf(stack.peek()).priority) {
+                        stack.push(op.name)
+                    } else {
+                        while (!stack.isEmpty() && "(" != stack.peek()) {
+                            if (op.priority <= Operation.valueOf(stack.peek()).priority) {
+                                output.add(stack.pop())
+                            }
+                        }
+                        stack.push(op.name)
+                    }
+                }
+
+                str == "(" -> {
+                    stack.push("(")
+                }
+
+                str == ")" -> {
+                    while(!stack.isEmpty()) {
+                        if("(" == stack.peek()) {
+                            stack.pop()
+                            break
+                        } else {
+                            output.add(stack.pop())
+                        }
+                    }
+                }
+
+                else -> {
+                    when {
+                        str.contains(".") -> {
+                            val result = parseGetReference(
+                                str,
+                                tree,
+                                line,
+                                if(
+                                    str.split(".")[0]
+                                    == defaultSection?.name
+                                ) defaultSection else null
+                            )
+                            output.add(Prov { result.value!!() })
+                        }
+
+                        else -> {
+                            output.add(parseReferenceValue(tree, str, line) ?: str)
                         }
                     }
                 }
             }
-
-            first = false
         }
 
-         */
-        return Boolp { true }
+        while(!stack.isEmpty()) {
+            output.add(stack.pop())
+        }
+
+        println(value)
+        println(list)
+        println(output)
+
+
+        return Boolp {
+            val outStack = Stack<Any>()
+            for(out in output) {
+                val op = Operation.values().firstOrNull { it.name == out.toString() }
+                if(op == null) {
+                    when(out) {
+                        is Prov<*> -> outStack.push(out.get())
+                        else -> outStack.push(out)
+                    }
+                } else {
+                    if(op == Operation.not) {
+                        if(outStack.size == 0) throw SyntaxException("syntax error.")
+                        val first = outStack.pop()
+                        outStack.push(op.parser(
+                            first.toString(),
+                            ""
+                        ))
+                    } else {
+                        println(outStack)
+                        if(outStack.size < 2) throw SyntaxException("syntax error.")
+                        val second = outStack.pop()
+                        val first = outStack.pop()
+                        println("first $first second $second")
+                        outStack.push(
+                            op.parser(
+                                first.toString(),
+                                second.toString()
+                            )
+                        )
+                    }
+                }
+            }
+
+            if(outStack.size > 1) throw SyntaxException("syntax error.")
+            outStack.pop().toString().toBoolean()
+        }
     }
 
     data class TemporarySection(
