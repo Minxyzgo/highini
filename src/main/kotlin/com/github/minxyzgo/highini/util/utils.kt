@@ -3,13 +3,20 @@ package com.github.minxyzgo.highini.util
 import com.github.minxyzgo.highini.annotation.*
 import com.github.minxyzgo.highini.exception.*
 import com.github.minxyzgo.highini.exception.ParseException.Companion.setStackTrace
-import com.github.minxyzgo.highini.func.Prov
+import com.github.minxyzgo.highini.func.*
+import com.github.minxyzgo.highini.parse.*
 import com.github.minxyzgo.highini.type.*
 import java.io.*
 import java.lang.reflect.*
 import java.util.*
 
 private val cacheFieldMap: MutableMap<Class<*>, Map<String, Field>> = mutableMapOf()
+
+fun parserBuild(accessible: Boolean = false): Parser {
+    val parser = Parser(accessible)
+    parser.reader = HIniReaderImpl(parser)
+    return parser
+}
 
 fun Class<*>.allFieldMap(): Map<String, Field>  {
     cacheFieldMap[this]?.let { return it }

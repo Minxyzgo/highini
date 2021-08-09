@@ -2,12 +2,13 @@ package com.github.minxyzgo.highini
 
 import com.github.minxyzgo.highini.parse.*
 import com.github.minxyzgo.highini.type.*
+import com.github.minxyzgo.highini.util.*
 import java.io.*
 import java.net.*
 
 object ConfigFactory {
     @JvmOverloads
-    fun parseResources(url: URL, parser: Parser = Parser()): ConfigTree {
+    fun parseResources(url: URL, parser: Parser = parserBuild()): ConfigTree {
         parser.startParse()
         val result = parser.parseTree(
             url.openStream().bufferedReader(),
@@ -19,7 +20,7 @@ object ConfigFactory {
     }
 
     @JvmOverloads
-    fun parseFile(file: File, parser: Parser = Parser()): ConfigTree {
+    fun parseFile(file: File, parser: Parser = parserBuild()): ConfigTree {
         parser.startParse()
         val result = parser.parseTree(file.bufferedReader(), file)
         parser.endParse()
@@ -29,7 +30,7 @@ object ConfigFactory {
     @JvmOverloads
     fun parseFiles(
         files: List<File>,
-        parser: Parser = Parser()
+        parser: Parser = parserBuild()
     ): List<ConfigTree> {
         val list = mutableListOf<ConfigTree>()
         parser.startParse()
@@ -45,7 +46,7 @@ object ConfigFactory {
     @JvmOverloads
     fun parseString(
         string: String,
-        parser: Parser = Parser()
+        parser: Parser = parserBuild()
     ): ConfigTree {
         parser.startParse()
         val result = parser.parseTree(
